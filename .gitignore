@@ -1,0 +1,20 @@
+node_modules/
+dist/
+config/director-settings.json
+config/runtime-state.json
+config/gui-error.log
+*.log
+.DS_Store
+
+# Local credentials and generated native helper
+.env
+.env.*
+!.env.example
+config/NativeWinHelper.dll
+*.pem
+*.key
+
+# One-off local migration/debug scripts; not required at runtime
+scripts/patch-*.mjs
+scripts/apply-agentic-upgrade.mjs
+scripts/recompile-dll.ps1

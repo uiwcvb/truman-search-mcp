@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "web-search": {
+      "command": "node",
+      "args": [
+        "./src/mcp-server.mjs"
+      ]
+    }
+  }
+}

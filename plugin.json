@@ -1,0 +1,13 @@
+{
+  "name": "web-search-mcp",
+  "displayName": "Web Search & Page Reader MCP",
+  "version": "1.0.0",
+  "description": "Primary web search and webpage Markdown content extraction MCP server.",
+  "keywords": [
+    "mcp",
+    "web-search",
+    "fetch-page",
+    "search"
+  ],
+  "license": "MIT"
+}

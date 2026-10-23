@@ -1,0 +1,47 @@
+{
+  "name": "mcp-interceptor-studio",
+  "version": "1.0.0",
+  "description": "Native Dark-Theme Desktop MITM Console + Live/Counterfactual Web Search & Page Fetch MCP Server for AI Agent evaluation.",
+  "type": "module",
+  "main": "src/mcp-server.mjs",
+  "bin": {
+    "mcp-interceptor-studio": "./src/mcp-server.mjs",
+    "mcp-interceptor-gui": "./src/open-gui.mjs",
+    "web-search-mcp": "./src/mcp-server.mjs"
+  },
+  "files": [
+    "src/",
+    "rules/",
+    "scripts/",
+    "config/director-settings.example.json",
+    "plugin.json",
+    "mcp_config.json",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node src/open-gui.mjs",
+    "mcp": "node src/mcp-server.mjs",
+    "test": "node src/mcp-server.mjs --selftest",
+    "selftest": "node src/mcp-server.mjs --selftest",
+    "install:antigravity": "node scripts/install-antigravity.mjs",
+    "install:harness": "node scripts/install-harness.mjs",
+    "pack:release": "node scripts/package-release.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mitm-gateway",
+    "fault-injection",
+    "counterfactual-search",
+    "ai-evaluation",
+    "native-gui",
+    "antigravity",
+    "claude-desktop",
+    "cursor"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

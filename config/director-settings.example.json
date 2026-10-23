@@ -1,0 +1,18 @@
+{
+  "uiLang": "zh",
+  "includeLinks": true,
+  "enableThinking": true,
+  "agentMode": true,
+  "agentMaxSteps": 4,
+  "autoApprove": false,
+  "blendMode": "focused",
+  "plausibilityMode": "realistic",
+  "globalLore": "",
+  "llm": {
+    "provider": "openai",
+    "baseUrl": "https://api.openai.com/v1",
+    "apiKey": "",
+    "model": "gpt-4o-mini",
+    "maxTokens": 16384
+  }
+}
