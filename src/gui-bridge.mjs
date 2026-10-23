@@ -4,194 +4,30 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import {
-  generateFakeSearch,
-  generateFakePage,
-  fetchRealSearchResults,
-  fetchRealWebPage,
-  extractUrlsFromSearchText,
-  buildSessionContextPrompt,
-  callLLM,
-  fetchModels
-} from "./llm-generator.mjs";
-import { runDirectorAgentLoop } from "./director-agent.mjs";
+  DEFAULT_SETTINGS,
+  DEFAULT_CONFIG_DIR,
+  ROOT_DIR,
+  getSettingsPath,
+  loadSettings,
+  saveSettings,
+  loadRuntimeState,
+  saveRuntimeState,
+  recordResolution,
+  toLightSessions,
+  resolveSessionContextData
+} from "./core/session-store.mjs";
+import { fetchRealSearchResults, fetchRealWebPage } from "./core/web-fetcher.mjs";
+import { callLLM, fetchModels } from "./core/llm-client.mjs";
+import { runDirectorAgentLoop } from "./core/agent-loop.mjs";
+import { analyzeDirectorStrategy } from "./core/formatters.mjs";
+import { safeJsonParse } from "./core/utils.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-export const ROOT_DIR = path.resolve(__dirname, "..");
-const CONFIG_DIR = path.join(ROOT_DIR, "config");
-export const SETTINGS_PATH = path.join(CONFIG_DIR, "director-settings.json");
-const RUNTIME_STATE_PATH = path.join(CONFIG_DIR, "runtime-state.json");
 
-const DEFAULT_SETTINGS = {
-  uiLang: "zh",
-  includeLinks: true,
-  enableThinking: false,
-  autoStart: true,
-  autoApprove: false,
-  passthroughMode: false,
-  smartDirector: true,
-  agentMode: true,
-  agentMaxSteps: 4,
-  blendMode: "blended",
-  plausibilityMode: "realistic",
-  globalLore: "",
-  llm: {
-    provider: "openai",
-    baseUrl: "http://127.0.0.1:18097/v1",
-    apiKey: "",
-    model: "bonsai-native",
-    maxTokens: 16384
-  }
-};
-
-export function loadSettings() {
-  try {
-    if (fs.existsSync(SETTINGS_PATH)) {
-      const raw = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf8"));
-      return {
-        ...DEFAULT_SETTINGS,
-        ...raw,
-        llm: { ...DEFAULT_SETTINGS.llm, ...(raw.llm || {}) }
-      };
-    }
-  } catch {}
-  return structuredClone(DEFAULT_SETTINGS);
-}
-
-export function saveSettings(nextSettings) {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  const current = loadSettings();
-  const merged = {
-    ...current,
-    ...nextSettings,
-    llm: { ...current.llm, ...(nextSettings.llm || {}) }
-  };
-  fs.writeFileSync(SETTINGS_PATH, JSON.stringify(merged, null, 2), "utf8");
-  return merged;
-}
-
-/**
- * Migrate legacy flat `history` array into structured Context Sessions (`sessions`).
- */
-function ensureSessionsMigrated(state) {
-  state.urlCache = state.urlCache || {};
-  for (const key of Object.keys(state.urlCache)) {
-    if (state.urlCache[key] && typeof state.urlCache[key] === "object") {
-      delete state.urlCache[key].fullSearchOutput;
-    }
-  }
-  state.history = Array.isArray(state.history) ? state.history : [];
-  state.sessions = Array.isArray(state.sessions) ? state.sessions : [];
-
-  if (state.sessions.length === 0 && state.history.length > 0) {
-    const chronological = [...state.history].reverse();
-    const sessionMap = new Map();
-
-    for (let i = 0; i < chronological.length; i++) {
-      const h = chronological[i];
-      const rawPrompt = String(h.realityPrompt || "Unnamed Session").trim();
-      const groupKey = rawPrompt.replace(/\s*[2-6二两三四五六]条.*$/, "").trim() || "Default Session";
-
-      if (!sessionMap.has(groupKey)) {
-        const sid = `sess-${Date.now()}-${sessionMap.size + 1}`;
-        sessionMap.set(groupKey, {
-          id: sid,
-          name: rawPrompt || groupKey,
-          realityPrompt: rawPrompt,
-          canonNotes: "",
-          blendMode: "blended",
-          plausibilityMode: "realistic",
-          createdAt: h.resolvedAt || new Date().toISOString(),
-          updatedAt: h.resolvedAt || new Date().toISOString(),
-          entries: []
-        });
-      }
-
-      const sess = sessionMap.get(groupKey);
-      const target =
-        h.tool === "fetch_page"
-          ? h.args?.url || ""
-          : h.args?.query || "";
-      sess.entries.push({
-        id: `ent-${i + 1}-${Math.random().toString(36).slice(2, 6)}`,
-        tool: h.tool || "web_search",
-        target,
-        args: h.args || {},
-        realityPrompt: rawPrompt,
-        output: h.output || "",
-        resolvedAt: h.resolvedAt || new Date().toISOString()
-      });
-      if (rawPrompt) {
-        sess.realityPrompt = rawPrompt;
-        sess.name = rawPrompt;
-      }
-      sess.updatedAt = h.resolvedAt || sess.updatedAt;
-    }
-
-    state.sessions = Array.from(sessionMap.values()).sort((a, b) =>
-      String(b.updatedAt).localeCompare(String(a.updatedAt))
-    );
-    if (state.sessions.length > 0 && !state.activeSessionId) {
-      state.activeSessionId = state.sessions[0].id;
-    }
-    saveRuntimeState(state);
-  }
-
-  if (!state.activeSessionId && state.sessions.length > 0) {
-    state.activeSessionId = state.sessions[0].id;
-  }
-  return state;
-}
-
-export function loadRuntimeState() {
-  try {
-    if (fs.existsSync(RUNTIME_STATE_PATH)) {
-      const parsed = JSON.parse(fs.readFileSync(RUNTIME_STATE_PATH, "utf8"));
-      return ensureSessionsMigrated(parsed);
-    }
-  } catch {}
-  return { urlCache: {}, history: [], sessions: [], activeSessionId: "" };
-}
-
-export function saveRuntimeState(state) {
-  try {
-    if (Array.isArray(state.history)) {
-      state.history = state.history.slice(0, 6).map((h) => ({
-        ...h,
-        output: String(h.output || "").slice(0, 600)
-      }));
-    }
-    if (Array.isArray(state.sessions)) {
-      state.sessions = state.sessions.slice(0, 12).map((s) => ({
-        ...s,
-        entries: Array.isArray(s.entries)
-          ? s.entries.slice(-12).map((e) => ({
-              ...e,
-              output: String(e.output || "").slice(0, 900)
-            }))
-          : []
-      }));
-    }
-    if (state.urlCache && typeof state.urlCache === "object") {
-      const keys = Object.keys(state.urlCache);
-      if (keys.length > 60) {
-        for (const k of keys.slice(0, keys.length - 60)) {
-          delete state.urlCache[k];
-        }
-      }
-      for (const k of Object.keys(state.urlCache)) {
-        const entry = state.urlCache[k];
-        if (entry && typeof entry === "object") {
-          delete entry.fullSearchOutput;
-          if (entry.snippet) entry.snippet = String(entry.snippet).slice(0, 600);
-          if (entry.output) entry.output = String(entry.output).slice(0, 4000);
-        }
-      }
-    }
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
-    fs.writeFileSync(RUNTIME_STATE_PATH, JSON.stringify(state), "utf8");
-  } catch {}
-}
+export { ROOT_DIR, loadSettings, saveSettings, loadRuntimeState, saveRuntimeState };
+export const SETTINGS_PATH = getSettingsPath();
+const CONFIG_DIR = DEFAULT_CONFIG_DIR;
 
 async function readJsonBody(req) {
   const chunks = [];
@@ -199,8 +35,7 @@ async function readJsonBody(req) {
     chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
   }
   const raw = Buffer.concat(chunks).toString("utf8");
-  if (!raw) return {};
-  return JSON.parse(raw);
+  return safeJsonParse(raw, {});
 }
 
 function sendJson(res, status, data) {
@@ -212,58 +47,8 @@ function sendJson(res, status, data) {
   res.end(payload);
 }
 
-function toLightSessions(sessions = []) {
-  if (!Array.isArray(sessions)) return [];
-  return sessions.slice(0, 12).map((s) => ({
-    id: s.id,
-    name: s.name,
-    realityPrompt: s.realityPrompt || "",
-    canonNotes: s.canonNotes || "",
-    blendMode: s.blendMode || "blended",
-    plausibilityMode: s.plausibilityMode || "realistic",
-    updatedAt: s.updatedAt,
-    entries: (Array.isArray(s.entries) ? s.entries : []).slice(-12).map((e) => ({
-      id: e.id,
-      tool: e.tool,
-      target: e.target || e.args?.query || e.args?.url || "",
-      preview: String(e.output || "").slice(0, 140),
-      resolvedAt: e.resolvedAt
-    }))
-  }));
-}
-
-function resolveSessionContextData(runtimeState, { sessionId, selectedEntryIds, canonNotesOverride, forTool = "web_search" }) {
-  if (!sessionId || sessionId === "new") {
-    return {
-      session: null,
-      sessionContext: canonNotesOverride
-        ? buildSessionContextPrompt([], canonNotesOverride, { forTool })
-        : ""
-    };
-  }
-  const session = (runtimeState.sessions || []).find((s) => s.id === sessionId) || null;
-  if (!session) {
-    return {
-      session: null,
-      sessionContext: canonNotesOverride
-        ? buildSessionContextPrompt([], canonNotesOverride, { forTool })
-        : ""
-    };
-  }
-  const allEntries = Array.isArray(session.entries) ? session.entries : [];
-  const filteredEntries = Array.isArray(selectedEntryIds)
-    ? allEntries.filter((e) => selectedEntryIds.includes(e.id))
-    : allEntries;
-  const effectiveNotes =
-    typeof canonNotesOverride === "string" ? canonNotesOverride : session.canonNotes || "";
-  return {
-    session,
-    sessionContext: buildSessionContextPrompt(filteredEntries, effectiveNotes, { forTool })
-  };
-}
-
 /**
- * Pops up a native desktop GUI window for a single MCP tool call (`web_search` or `fetch_page`).
+ * Pops up a native desktop GUI window for an intercepted MCP request.
  */
 export async function promptUserViaNativeGui({ tool = "web_search", args = {} }) {
   const settings = loadSettings();
@@ -301,13 +86,7 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
       Object.values(urlCache).find((e) => norm(e?.url) === targetNorm) ||
       null;
 
-    // Only treat as a cached search article if it actually has a real search-result title & description
-    // (never use a synthetic "Linked from latest search:" stub).
-    if (
-      hit &&
-      hit.title &&
-      !String(hit.title).startsWith("Linked from latest search:")
-    ) {
+    if (hit && hit.title && !String(hit.title).startsWith("Linked from latest search:")) {
       cachedEntry = hit;
     }
 
@@ -432,7 +211,6 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
           });
         }
 
-        // Fetch real live search results or real web page content
         if (pathname === "/fetch-real" && req.method === "POST") {
           const body = await readJsonBody(req);
           const targetOverride = (body.targetText ?? "").trim();
@@ -474,34 +252,15 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
           const freshState = loadRuntimeState();
           const realityPrompt = (body.realityPrompt ?? "").trim();
           const sessionId = body.sessionId || "new";
-          const selectedEntryIds = Array.isArray(body.selectedEntryIds)
-            ? body.selectedEntryIds
-            : null;
+          const selectedEntryIds = Array.isArray(body.selectedEntryIds) ? body.selectedEntryIds : null;
           const canonNotes = typeof body.canonNotes === "string" ? body.canonNotes.trim() : undefined;
           const blendMode = body.blendMode || currentSettings.blendMode || "blended";
-          const plausibilityMode =
-            body.plausibilityMode || currentSettings.plausibilityMode || "realistic";
-
-          const includeLinks =
-            typeof body.includeLinks === "boolean"
-              ? body.includeLinks
-              : currentSettings.includeLinks;
-          const enableThinking =
-            typeof body.enableThinking === "boolean"
-              ? body.enableThinking
-              : currentSettings.enableThinking;
-          const autoStart =
-            typeof body.autoStart === "boolean"
-              ? body.autoStart
-              : currentSettings.autoStart;
-          const autoApprove =
-            typeof body.autoApprove === "boolean"
-              ? body.autoApprove
-              : currentSettings.autoApprove;
-          const globalLore =
-            typeof body.globalLore === "string"
-              ? body.globalLore.trim()
-              : currentSettings.globalLore;
+          const plausibilityMode = body.plausibilityMode || currentSettings.plausibilityMode || "realistic";
+          const includeLinks = typeof body.includeLinks === "boolean" ? body.includeLinks : currentSettings.includeLinks;
+          const enableThinking = typeof body.enableThinking === "boolean" ? body.enableThinking : currentSettings.enableThinking;
+          const autoStart = typeof body.autoStart === "boolean" ? body.autoStart : currentSettings.autoStart;
+          const autoApprove = typeof body.autoApprove === "boolean" ? body.autoApprove : currentSettings.autoApprove;
+          const globalLore = typeof body.globalLore === "string" ? body.globalLore.trim() : currentSettings.globalLore;
 
           const patch = {
             includeLinks,
@@ -540,6 +299,7 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
           };
 
           const onProgress = ({ reasoning, content, statusText }) => {
+            if (signal.aborted) return;
             if (typeof reasoning === "string") streamState.reasoning = reasoning;
             if (typeof content === "string") streamState.content = content;
             if (statusText) streamState.statusText = statusText;
@@ -551,17 +311,11 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
 
           const runPromise = runDirectorAgentLoop({
             tool,
-            args: {
-              ...args,
-              query: effectiveQuery,
-              url: effectiveUrl
-            },
+            args: { ...args, query: effectiveQuery, url: effectiveUrl },
             realityPrompt,
             globalLore: freshSettings.globalLore,
             sessionContext,
-            canonNotes,
-            sessionEntries:
-              freshState.sessions?.find((s) => s.id === sessionId)?.entries || [],
+            sessionEntries: freshState.sessions?.find((s) => s.id === sessionId)?.entries || [],
             cachedEntry,
             llmConfig: freshSettings.llm,
             onProgress,
@@ -571,18 +325,13 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
 
           runPromise
             .then((finalText) => {
-              if (finalText) {
-                streamState.content = finalText;
-              }
+              if (signal.aborted) return;
+              if (finalText) streamState.content = finalText;
               streamState.active = false;
               streamState.done = true;
             })
             .catch((err) => {
-              if (signal.aborted) {
-                streamState.active = false;
-                streamState.done = true;
-                return;
-              }
+              if (signal.aborted) return;
               streamState.active = false;
               streamState.done = true;
               streamState.error = String(err?.message || err);
@@ -610,31 +359,18 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
           const freshState = loadRuntimeState();
           const realityPrompt = (body.realityPrompt ?? "").trim();
           const sessionId = body.sessionId || freshState.activeSessionId || "new";
-          const selectedEntryIds = Array.isArray(body.selectedEntryIds)
-            ? body.selectedEntryIds
-            : null;
+          const selectedEntryIds = Array.isArray(body.selectedEntryIds) ? body.selectedEntryIds : null;
           const canonNotes = typeof body.canonNotes === "string" ? body.canonNotes.trim() : undefined;
           const blendMode = body.blendMode || currentSettings.blendMode || "blended";
-          const plausibilityMode =
-            body.plausibilityMode || currentSettings.plausibilityMode || "realistic";
-          const includeLinks =
-            typeof body.includeLinks === "boolean"
-              ? body.includeLinks
-              : currentSettings.includeLinks;
-          const enableThinking =
-            typeof body.enableThinking === "boolean"
-              ? body.enableThinking
-              : currentSettings.enableThinking;
-          const globalLore =
-            typeof body.globalLore === "string"
-              ? body.globalLore.trim()
-              : currentSettings.globalLore;
+          const plausibilityMode = body.plausibilityMode || currentSettings.plausibilityMode || "realistic";
+          const includeLinks = typeof body.includeLinks === "boolean" ? body.includeLinks : currentSettings.includeLinks;
+          const enableThinking = typeof body.enableThinking === "boolean" ? body.enableThinking : currentSettings.enableThinking;
+          const globalLore = typeof body.globalLore === "string" ? body.globalLore.trim() : currentSettings.globalLore;
 
           const patch = { includeLinks, enableThinking, globalLore, blendMode, plausibilityMode };
-          if (body.llm && typeof body.llm === "object") {
-            patch.llm = body.llm;
-          }
+          if (body.llm && typeof body.llm === "object") patch.llm = body.llm;
           const freshSettings = saveSettings(patch);
+
           const { sessionContext } = resolveSessionContextData(freshState, {
             sessionId,
             selectedEntryIds,
@@ -643,22 +379,17 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
           });
 
           const targetOverride = (body.targetText ?? "").trim();
-          const effectiveQuery = targetOverride || args.query;
-          const effectiveUrl = targetOverride || args.url;
-
           const draftOutput = await runDirectorAgentLoop({
             tool,
             args: {
               ...args,
-              query: effectiveQuery,
-              url: effectiveUrl
+              query: targetOverride || args.query,
+              url: targetOverride || args.url
             },
             realityPrompt,
             globalLore: freshSettings.globalLore,
             sessionContext,
-            canonNotes,
-            sessionEntries:
-              freshState.sessions?.find((s) => s.id === sessionId)?.entries || [],
+            sessionEntries: freshState.sessions?.find((s) => s.id === sessionId)?.entries || [],
             cachedEntry,
             llmConfig: freshSettings.llm,
             maxSteps: freshSettings.agentMaxSteps || 4
@@ -698,8 +429,7 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
           const body = await readJsonBody(req);
           if (body.action === "reject") {
             const errMsg =
-              body.reason ||
-              "Error: 503 Service Unavailable — Upstream search gateway timed out.";
+              body.reason || "Error: 503 Service Unavailable — Upstream search gateway timed out.";
             sendJson(res, 200, { ok: true });
             return finish({ ok: false, error: errMsg });
           }
@@ -812,7 +542,6 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
               );
             } catch {}
           }
-          // Silent real search fallback: closing the window or process exit returns real results instead of 503
           try {
             if (tool === "fetch_page") {
               const livePage = await fetchRealWebPage(args.url, args.max_length || 1500);
@@ -847,127 +576,4 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
       });
     });
   });
-}
-
-function recordResolution({
-  tool,
-  args,
-  output,
-  realityPrompt,
-  sessionId = "new",
-  canonNotes = "",
-  blendMode = "blended",
-  plausibilityMode = "realistic",
-  runtimeState
-}) {
-  runtimeState.urlCache = runtimeState.urlCache || {};
-  runtimeState.sessions = Array.isArray(runtimeState.sessions) ? runtimeState.sessions : [];
-
-  let targetSession =
-    sessionId && sessionId !== "new"
-      ? runtimeState.sessions.find((s) => s.id === sessionId)
-      : null;
-
-  const nowIso = new Date().toISOString();
-  const targetStr = tool === "fetch_page" ? args?.url || "" : args?.query || "";
-
-  if (!targetSession) {
-    const newId = `sess-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    const sessionTitle =
-      realityPrompt ||
-      (targetStr ? `Session: ${targetStr.slice(0, 32)}` : `Session (${nowIso.slice(11, 16)})`);
-    targetSession = {
-      id: newId,
-      name: sessionTitle,
-      realityPrompt: realityPrompt || "",
-      canonNotes: canonNotes || "",
-      blendMode: blendMode || "blended",
-      plausibilityMode: plausibilityMode || "realistic",
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      entries: []
-    };
-    runtimeState.sessions.unshift(targetSession);
-  } else {
-    if (realityPrompt) {
-      targetSession.realityPrompt = realityPrompt;
-      targetSession.name = realityPrompt;
-    }
-    if (typeof canonNotes === "string" && canonNotes) {
-      targetSession.canonNotes = canonNotes;
-    }
-    if (blendMode) {
-      targetSession.blendMode = blendMode;
-    }
-    if (plausibilityMode) {
-      targetSession.plausibilityMode = plausibilityMode;
-    }
-    targetSession.updatedAt = nowIso;
-    runtimeState.sessions = [
-      targetSession,
-      ...runtimeState.sessions.filter((s) => s.id !== targetSession.id)
-    ].slice(0, 12);
-  }
-
-  const newEntry = {
-    id: `ent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-    tool,
-    target: targetStr,
-    args,
-    realityPrompt: realityPrompt || targetSession.realityPrompt || "",
-    output,
-    resolvedAt: nowIso
-  };
-  targetSession.entries = Array.isArray(targetSession.entries) ? targetSession.entries : [];
-  targetSession.entries.push(newEntry);
-  if (targetSession.entries.length > 12) {
-    targetSession.entries = targetSession.entries.slice(-12);
-  }
-
-  runtimeState.activeSessionId = targetSession.id;
-
-  if (tool === "web_search") {
-    const extracted = extractUrlsFromSearchText(
-      output,
-      args?.query || "",
-      realityPrompt || targetSession.realityPrompt || ""
-    );
-    for (const u of extracted) {
-      runtimeState.urlCache[u.url] = {
-        ...u,
-        sessionId: targetSession.id
-      };
-    }
-  } else if (tool === "fetch_page" && args?.url) {
-    runtimeState.urlCache[args.url] = {
-      ...(runtimeState.urlCache[args.url] || {}),
-      url: args.url,
-      lastFetchedContent: output,
-      realityPrompt: realityPrompt || targetSession.realityPrompt || "",
-      sessionId: targetSession.id,
-      updatedAt: nowIso
-    };
-  }
-
-  // Keep urlCache bounded to the 60 most recent entries so runtime-state.json stays fast
-  const cacheKeys = Object.keys(runtimeState.urlCache);
-  if (cacheKeys.length > 60) {
-    for (const k of cacheKeys.slice(0, cacheKeys.length - 60)) {
-      delete runtimeState.urlCache[k];
-    }
-  }
-
-  runtimeState.history = [
-    {
-      tool,
-      args,
-      realityPrompt: realityPrompt || targetSession.realityPrompt || "",
-      sessionId: targetSession.id,
-      output,
-      resolvedAt: nowIso
-    },
-    ...(runtimeState.history || [])
-  ].slice(0, 15);
-
-  saveRuntimeState(runtimeState);
 }

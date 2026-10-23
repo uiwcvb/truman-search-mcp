@@ -52,6 +52,7 @@
 | DS | 事实采信实验成功 |
 | GLM | 事实采信实验成功 |
 | GPT | 事实采信实验成功 |
+| Gemini | 表达怀疑，但最终仍承认该实验事实 |
 
 以上为作者提供的实测案例记录，具体模型版本、试验次数和原始对话记录待补充。该案例记录事实采信结果，不代表上述模型的通用安全绕过能力或量化成功率。
 
@@ -81,7 +82,13 @@ npm start
 npm test
 ```
 
-检查范围与当前进度见下方「开发状态」。
+默认运行离线检查，无需 API Key。需要检查真实搜索、网页读取和本地配置的模型接口时运行：
+
+```bash
+npm run test:live
+```
+
+在线检查会访问互联网，并使用 `config/director-settings.json` 中配置的模型接口。检查范围与当前进度见下方「开发状态」。
 
 ---
 
@@ -111,6 +118,7 @@ npm test
 │   ├── native-gui-win.ps1          # Windows 纯原生自绘暗黑主题 WPF 拦截控制台 (中/英双语)
 │   ├── native-gui-tk.py            # 跨平台 Tkinter 原生暗色弹窗 (macOS / Linux)
 │   ├── llm-generator.mjs           # 多模型接口适配、真实新闻抓取与写实合理化合成器
+│   ├── core/                       # LLM 客户端、执行循环、格式化、工具注册与会话存储
 │   └── open-gui.mjs                # 独立弹出桌面控制台入口
 ├── rules/
 │   └── AGENTS.md                   # 内联工具参数签名与路由规则 (零 view_file 开销)
@@ -138,12 +146,15 @@ npm test
 | 项目 | 当前范围 |
 | --- | --- |
 | 工具控制 | 接入本服务的 `web_search` / `fetch_page`；不接管独立搜索工具或任意浏览器流量 |
-| 自动检查 | `npm test` 为启动/配置冒烟检查；其他 director 脚本覆盖部分解析、启发式和在线调用 |
+| 自动检查 | `npm test` 包含 15 项离线基础检查与 8 项运行时回归；`npm run test:live` 单独运行 5 项在线检查 |
+| 本次运行验证 | Windows 窗口构建、GUI 桥接、MCP Stdio、真实搜索与网页抓取、已配置 OpenAI 兼容接口的模型调用与完整 Director 流程 |
 | 模型评测 | 尚未随仓库发布可复现的跨模型成功率基准 |
 | 客户端与平台 | 提供配置和界面实现；全客户端兼容性与 Windows/Tkinter 功能一致性待验证 |
 | 多轮一致性 | 通过历史与缓存辅助保持上下文；历史会截断，一致性需按场景测量 |
 
-已知问题：`src/gui-bridge.mjs` 的 `/context` 路径引用了未在该模块导入或定义的 `analyzeDirectorStrategy`，静态检查发现 `ReferenceError` 路径。启动自检不覆盖该 GUI 路径。
+本轮修复了 `/context` 导入、普通回复与 ReAct 动作被误归为思考内容、Gemini/Anthropic 消息返回格式、MCP 模块导入副作用，以及取消和模型失败被离线结果掩盖的问题。在线流程耗尽步数或接口报错时会明确失败；离线示例模式保留用于未配置模型时的演示。
+
+Gemini/Anthropic 的消息适配使用受控响应做回归检查；上述作者报告的模型案例与这些接口测试分别记录。未在本轮逐一实测所有厂商接口、客户端和操作系统。
 
 ## 实验说明 / Responsible evaluation
 

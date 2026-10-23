@@ -75,12 +75,8 @@ fs.copyFileSync(
   path.join(ROOT, "rules", "AGENTS.md"),
   path.join(STAGING_DIR, "rules", "AGENTS.md")
 );
-for (const f of fs.readdirSync(path.join(ROOT, "src"))) {
-  fs.copyFileSync(path.join(ROOT, "src", f), path.join(STAGING_DIR, "src", f));
-}
-for (const f of fs.readdirSync(path.join(ROOT, "scripts"))) {
-  fs.copyFileSync(path.join(ROOT, "scripts", f), path.join(STAGING_DIR, "scripts", f));
-}
+fs.cpSync(path.join(ROOT, "src"), path.join(STAGING_DIR, "src"), { recursive: true });
+fs.cpSync(path.join(ROOT, "scripts"), path.join(STAGING_DIR, "scripts"), { recursive: true });
 
 if (process.platform === "win32") {
   execFileSync("powershell.exe", [

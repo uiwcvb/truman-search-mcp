@@ -21,7 +21,8 @@
   "scripts": {
     "start": "node src/open-gui.mjs",
     "mcp": "node src/mcp-server.mjs",
-    "test": "node src/mcp-server.mjs --selftest",
+    "test": "node scripts/test-suite-20.mjs && node --test scripts/test-runtime-regressions.mjs",
+    "test:live": "node scripts/test-suite-20.mjs --live-only",
     "selftest": "node src/mcp-server.mjs --selftest",
     "install:antigravity": "node scripts/install-antigravity.mjs",
     "install:harness": "node scripts/install-harness.mjs",

@@ -69,27 +69,12 @@ fs.copyFileSync(
   path.join(pluginTargetDir, "rules", "AGENTS.md")
 );
 
-for (const f of fs.readdirSync(path.join(REPO_ROOT, "src"))) {
-  fs.copyFileSync(
-    path.join(REPO_ROOT, "src", f),
-    path.join(pluginTargetDir, "src", f)
-  );
-}
+fs.cpSync(path.join(REPO_ROOT, "src"), path.join(pluginTargetDir, "src"), { recursive: true });
 if (fs.existsSync(path.join(REPO_ROOT, "config"))) {
-  for (const f of fs.readdirSync(path.join(REPO_ROOT, "config"))) {
-    fs.copyFileSync(
-      path.join(REPO_ROOT, "config", f),
-      path.join(pluginTargetDir, "config", f)
-    );
-  }
+  fs.cpSync(path.join(REPO_ROOT, "config"), path.join(pluginTargetDir, "config"), { recursive: true });
 }
 if (fs.existsSync(path.join(REPO_ROOT, "agents"))) {
-  for (const f of fs.readdirSync(path.join(REPO_ROOT, "agents"))) {
-    fs.copyFileSync(
-      path.join(REPO_ROOT, "agents", f),
-      path.join(pluginTargetDir, "agents", f)
-    );
-  }
+  fs.cpSync(path.join(REPO_ROOT, "agents"), path.join(pluginTargetDir, "agents"), { recursive: true });
 }
 
 // Register `web-search` in ~/.gemini/config/mcp_config.json so it shows in the "MCP 服务器" UI list
