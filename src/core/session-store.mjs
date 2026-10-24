@@ -137,36 +137,57 @@ export function loadRuntimeState(configDir = DEFAULT_CONFIG_DIR) {
   return { urlCache: {}, history: [], sessions: [], activeSessionId: "" };
 }
 
+export function prepareRuntimeStateForSave(state) {
+  if (!state || typeof state !== "object") {
+    return { urlCache: {}, history: [], sessions: [], activeSessionId: "" };
+  }
+  const cloned = {
+    activeSessionId: state.activeSessionId || "",
+    urlCache: {},
+    history: [],
+    sessions: []
+  };
+
+  if (state.urlCache && typeof state.urlCache === "object") {
+    const keys = Object.keys(state.urlCache);
+    const startIdx = Math.max(0, keys.length - 60);
+    for (let i = startIdx; i < keys.length; i++) {
+      const k = keys[i];
+      cloned.urlCache[k] = { ...state.urlCache[k] };
+    }
+  }
+
+  if (Array.isArray(state.history)) {
+    cloned.history = state.history.slice(0, 15).map((h) => ({
+      ...h,
+      output: String(h.output || "").slice(0, 600)
+    }));
+  }
+
+  if (Array.isArray(state.sessions)) {
+    cloned.sessions = state.sessions.slice(0, 12).map((s) => ({
+      ...s,
+      entries: Array.isArray(s.entries)
+        ? s.entries.slice(-12).map((e) => ({
+            ...e,
+            output: String(e.output || "").slice(0, 900)
+          }))
+        : []
+    }));
+  }
+
+  return cloned;
+}
+
 export function saveRuntimeState(state, configDir = DEFAULT_CONFIG_DIR) {
   const p = getRuntimeStatePath(configDir);
+  const toSave = prepareRuntimeStateForSave(state);
   try {
-    if (Array.isArray(state.history)) {
-      state.history = state.history.slice(0, 15).map((h) => ({
-        ...h,
-        output: String(h.output || "").slice(0, 600)
-      }));
-    }
-    if (Array.isArray(state.sessions)) {
-      state.sessions = state.sessions.slice(0, 12).map((s) => ({
-        ...s,
-        entries: Array.isArray(s.entries)
-          ? s.entries.slice(-12).map((e) => ({
-              ...e,
-              output: String(e.output || "").slice(0, 900)
-            }))
-          : []
-      }));
-    }
-    if (state.urlCache && typeof state.urlCache === "object") {
-      const keys = Object.keys(state.urlCache);
-      if (keys.length > 60) {
-        for (const k of keys.slice(0, keys.length - 60)) {
-          delete state.urlCache[k];
-        }
-      }
-    }
-    atomicWriteJson(p, state);
-  } catch {}
+    atomicWriteJson(p, toSave);
+    return { ok: true, state: toSave };
+  } catch (err) {
+    throw new Error(`Failed to save runtime state to "${p}": ${err.message || err}`, { cause: err });
+  }
 }
 
 export function toLightSessions(sessions = []) {
@@ -226,6 +247,7 @@ export function recordResolution({
   realityPrompt,
   sessionId = "new",
   canonNotes = "",
+  canonUpdates = [],
   blendMode = "blended",
   plausibilityMode = "realistic",
   runtimeState,
@@ -274,6 +296,21 @@ export function recordResolution({
       targetSession,
       ...runtimeState.sessions.filter((s) => s.id !== targetSession.id)
     ].slice(0, 12);
+  }
+
+  // Consume and merge canonUpdates
+  const updates = Array.isArray(canonUpdates)
+    ? canonUpdates.map((u) => String(u || "").trim()).filter(Boolean)
+    : [];
+  if (updates.length > 0) {
+    const existing = (targetSession.canonNotes || "").trim();
+    const existingLines = existing ? existing.split("\n").map((l) => l.trim()).filter(Boolean) : [];
+    for (const u of updates) {
+      if (!existingLines.includes(u)) {
+        existingLines.push(u);
+      }
+    }
+    targetSession.canonNotes = existingLines.join("\n");
   }
 
   const newEntry = {

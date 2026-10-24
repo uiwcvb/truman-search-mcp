@@ -165,18 +165,41 @@ TOOL_HANDLERS.set("fetch_live_page", async (rawArgs) => {
   }
 });
 
-TOOL_HANDLERS.set("query_canon", async (_rawArgs, context) => {
-  return context.sessionContext || "No prior queries or established canon facts found in this session.";
+TOOL_HANDLERS.set("query_canon", async (_rawArgs, context = {}) => {
+  const content = context.sessionContext || "No prior queries or established canon facts found in this session.";
+  const canonUpdates = Array.isArray(context.canonUpdates) ? [...context.canonUpdates] : [];
+  return {
+    ok: true,
+    output: content,
+    canonUpdates,
+    includes(s) { return String(content).includes(s); },
+    indexOf(s) { return String(content).indexOf(s); },
+    startsWith(s) { return String(content).startsWith(s); },
+    toString() { return String(content); },
+    valueOf() { return String(content); }
+  };
 });
 
-TOOL_HANDLERS.set("record_canon", async (rawArgs, context) => {
+TOOL_HANDLERS.set("record_canon", async (rawArgs, context = {}) => {
   let f = "";
   if (typeof rawArgs === "string") f = rawArgs;
   else if (rawArgs && typeof rawArgs === "object") f = rawArgs.fact || "";
+  f = String(f || "").trim();
   if (f && typeof context.onRecordCanon === "function") {
     context.onRecordCanon(f);
   }
-  return `Canon fact successfully recorded: "${f}"`;
+  const msg = `Canon fact successfully recorded: "${f}"`;
+  const updates = f ? [f] : [];
+  return {
+    ok: true,
+    output: msg,
+    canonUpdates: updates,
+    includes(s) { return msg.includes(s); },
+    indexOf(s) { return msg.indexOf(s); },
+    startsWith(s) { return msg.startsWith(s); },
+    toString() { return msg; },
+    valueOf() { return msg; }
+  };
 });
 
 TOOL_HANDLERS.set("passthrough_real", async (rawArgs) => {
@@ -186,23 +209,29 @@ TOOL_HANDLERS.set("passthrough_real", async (rawArgs) => {
   return { isFinal: true, action: "passthrough_real", reason };
 });
 
-TOOL_HANDLERS.set("deliver_search_results", async (rawArgs, context) => {
+TOOL_HANDLERS.set("deliver_search_results", async (rawArgs, context = {}) => {
   let payload = "";
+  const includeLinks = context.includeLinks !== false;
   if (typeof rawArgs === "string") {
     payload = rawArgs;
   } else if (rawArgs && typeof rawArgs === "object") {
     if (rawArgs.formatted_text) {
       payload = rawArgs.formatted_text;
     } else if (Array.isArray(rawArgs.results)) {
-      payload = formatSearchResults(context.targetText || "search", rawArgs.results);
+      payload = formatSearchResults(context.targetText || "search", rawArgs.results, {
+        includeLinks
+      });
     } else {
       payload = rawArgs.payload || rawArgs.content || "";
     }
   }
+  if (!includeLinks && payload) {
+    payload = payload.replace(/\nURL:\s*https?:\/\/[^\r\n]+/gi, "");
+  }
   return { isFinal: true, action: "deliver_search_results", payload };
 });
 
-TOOL_HANDLERS.set("deliver_page_content", async (rawArgs, context) => {
+TOOL_HANDLERS.set("deliver_page_content", async (rawArgs, context = {}) => {
   let payload = "";
   if (typeof rawArgs === "string") {
     payload = rawArgs;

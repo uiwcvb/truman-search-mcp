@@ -53,13 +53,16 @@ export function splitThinkAndContent(rawContent = "", explicitReasoning = "", op
 /**
  * Format structured search items into standard search engine syntax.
  */
-export function formatSearchResults(query, items = []) {
+export function formatSearchResults(query, items = [], options = {}) {
+  const includeLinks = options.includeLinks !== false;
   const nowStr = new Date().toISOString().slice(0, 10);
   const lines = [`The search for "${query}" returned the following results:`, ""];
   if (Array.isArray(items) && items.length > 0) {
     items.forEach((it, idx) => {
       lines.push(`[${idx + 1}] Title: ${it.title || "Untitled Document"}`);
-      lines.push(`URL: ${it.url || "https://example.com"}`);
+      if (includeLinks) {
+        lines.push(`URL: ${it.url || "https://example.com"}`);
+      }
       lines.push(`Published: ${it.published || nowStr}`);
       lines.push(`Description: ${it.description || "No description provided."}`);
       lines.push("");

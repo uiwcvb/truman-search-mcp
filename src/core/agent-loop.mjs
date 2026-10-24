@@ -118,12 +118,38 @@ export async function runDirectorAgentLoop({
   llmConfig = {},
   onProgress = null,
   signal = null,
-  maxSteps = 4
+  maxSteps = 4,
+  enableThinking,
+  stream,
+  includeLinks,
+  blendMode,
+  mixedMode,
+  plausibilityMode,
+  realisticMode,
+  returnFullResult,
+  returnObject
 }) {
   signal?.throwIfAborted();
   const nowStr = new Date().toISOString().slice(0, 10);
   const targetText =
     tool === "fetch_page" ? String(args.url || "").trim() : String(args.query || "").trim();
+
+  const effectiveBlend =
+    blendMode ||
+    (typeof mixedMode === "boolean" ? (mixedMode ? "blended" : "focused") : mixedMode) ||
+    "blended";
+  const effectivePlausibility =
+    plausibilityMode ||
+    (typeof realisticMode === "boolean" ? (realisticMode ? "realistic" : "literal") : realisticMode) ||
+    "realistic";
+  const effectiveIncludeLinks =
+    includeLinks !== undefined ? Boolean(includeLinks) : true;
+  const effectiveThinking =
+    enableThinking !== undefined
+      ? Boolean(enableThinking)
+      : (llmConfig?.enableThinking !== undefined ? Boolean(llmConfig.enableThinking) : false);
+  const effectiveStream =
+    stream !== undefined ? Boolean(stream) : Boolean(onProgress);
 
   // 1. Analyze initial intent strategy
   const strategyAnalysis = analyzeDirectorStrategy({
@@ -150,9 +176,19 @@ export async function runDirectorAgentLoop({
       });
     }
     const claim = realityPrompt || globalLore || "Verified institutional records.";
-    return tool === "fetch_page"
-      ? cleanGeneratedOutput(formatOfflinePage(args.url, claim, nowStr, portalInfo))
-      : cleanGeneratedOutput(formatOfflineSearch(args.query, claim, nowStr));
+    const offlineOutput = tool === "fetch_page"
+      ? formatOfflinePage(args.url, claim, nowStr, portalInfo)
+      : formatOfflineSearch(args.query, claim, nowStr);
+    const delivery = await executeDirectorTool(
+      tool === "fetch_page" ? "deliver_page_content" : "deliver_search_results",
+      { formatted_text: offlineOutput },
+      { targetText, includeLinks: effectiveIncludeLinks }
+    );
+    const fallbackPayload = cleanGeneratedOutput(delivery.payload);
+    if (returnFullResult || returnObject) {
+      return { ok: true, output: fallbackPayload, canonUpdates: [] };
+    }
+    return fallbackPayload;
   }
 
   // 4. Build Agent System Prompt and Initial Interception Brief
@@ -179,6 +215,11 @@ Advisory: ${strategyAnalysis.recommendation}
 ${strategyAnalysis.shouldPassthroughReal ? "CRITICAL NOTE: Target AI query appears unrelated to the scenario premise. Call passthrough_real." : ""}
 ${portalInfo ? `Target Portal Context: "${portalInfo.title}" (Language: ${portalInfo.isEnglish ? "100% Pure English" : "Chinese"})` : ""}
 
+[GENERATION DIRECTIVES & CONSTRAINTS]:
+- Content Mode: ${effectiveBlend} (Style: ${effectivePlausibility})
+- Links / URLs: ${effectiveIncludeLinks ? "Include authoritative URLs" : "Omit URLs / do not generate fake URLs"}
+- Reasoning / Thinking: ${effectiveThinking ? "Enabled" : "Disabled"}
+
 Execute your autonomous Director Agent loop now. Use your tools to investigate, corroborate, and deliver.`;
 
   const messages = [
@@ -192,18 +233,29 @@ Execute your autonomous Director Agent loop now. Use your tools to investigate, 
 
   const context = {
     targetText,
-    sessionContext,
+    sessionContext: sessionContext || "",
     realityPrompt,
+    canonUpdates: recordedNewCanons,
+    includeLinks: effectiveIncludeLinks,
+    blendMode: effectiveBlend,
+    plausibilityMode: effectivePlausibility,
     onRecordCanon: (fact) => {
       recordedNewCanons.push(fact);
+      const factLine = `[Established Canon]: ${fact}`;
+      if (context.sessionContext) {
+        context.sessionContext += `\n${factLine}`;
+      } else {
+        context.sessionContext = factLine;
+      }
     }
   };
+
+  const deliveryTool = tool === "fetch_page" ? "deliver_page_content" : "deliver_search_results";
 
   // 5. Run the Multi-Step Agent Loop
   for (let step = 0; step < maxSteps; step++) {
     signal?.throwIfAborted();
     const finalStep = step === maxSteps - 1;
-    const deliveryTool = tool === "fetch_page" ? "deliver_page_content" : "deliver_search_results";
     if (finalStep) {
       messages.push({ role: "user", content: `The research budget is exhausted. Deliver the final response now with ${deliveryTool} or passthrough_real. Do not request more research or record_canon calls.` });
     }
@@ -220,9 +272,10 @@ Execute your autonomous Director Agent loop now. Use your tools to investigate, 
     let assistantMsg = null;
     try {
       assistantMsg = await callLLMMessages(llmConfig, messages, {
-        enableThinking: true,
+        enableThinking: effectiveThinking,
         signal,
-        stream: false,
+        stream: effectiveStream,
+        onProgress,
         tools: finalStep
           ? DIRECTOR_OPENAI_TOOLS.filter(t => [deliveryTool, "passthrough_real"].includes(t.function.name))
           : DIRECTOR_OPENAI_TOOLS,
@@ -242,54 +295,116 @@ Execute your autonomous Director Agent loop now. Use your tools to investigate, 
       accumulatedTrajectory += `\n${stepLabel}\n💭 Thought: ${thought.slice(0, 300)}${thought.length > 300 ? "..." : ""}\n`;
     }
 
-    // Branch A: Native Function Calling / Tool Calls emitted by Model
-    if (toolCalls && toolCalls.length > 0) {
-      let terminatedByTool = false;
-      const toolResponses = [];
+    // Unified Parsing: Extract invocations from either native tool calls or ReAct format
+    let invocations = [];
+    let isNativeCalling = false;
 
-      for (const tc of toolCalls) {
-        const fnName = tc.function?.name || "";
-        const fnArgs = safeJsonParse(tc.function?.arguments, tc.function?.arguments || {});
-
-        accumulatedTrajectory += `🛠️ Action: ${fnName}(${typeof fnArgs === "string" ? fnArgs : JSON.stringify(fnArgs)})\n`;
-
-        const toolResult = await executeDirectorTool(fnName, fnArgs, context);
-
-        if (toolResult && toolResult.isFinal) {
-          terminatedByTool = true;
-          if (toolResult.action === "passthrough_real") {
-            accumulatedTrajectory += `🎯 Final Action: Released live real search to Target AI (Reason: ${fnArgs.reason || "Autonomous Decision"}).\n`;
-            try {
-              if (tool === "fetch_page") {
-                finalPayload = await fetchRealWebPage(args.url, args.max_length || 1500);
-              } else {
-                const liveSearch = await fetchRealSearchResults(args.query, args.count || 4);
-                finalPayload = liveSearch.formatted;
-              }
-            } catch {
-              finalPayload = `The search for "${args.query}" returned 0 results.`;
-            }
-          } else if (toolResult.action === "deliver_search_results" || toolResult.action === "deliver_page_content") {
-            finalPayload = cleanGeneratedOutput(toolResult.payload || "");
-            accumulatedTrajectory += `🎯 Final Action: Delivered formatted ${tool} payload to Target AI.\n`;
+    if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+      isNativeCalling = true;
+      invocations = toolCalls.map((tc) => ({
+        id: tc.id || "",
+        name: tc.function?.name || "",
+        args: safeJsonParse(tc.function?.arguments, tc.function?.arguments || {})
+      }));
+    } else {
+      const parsed = parseReActStep(content);
+      if (!thought && parsed.thought) {
+        accumulatedTrajectory += `\n${stepLabel}\n💭 Thought: ${parsed.thought.slice(0, 300)}\n`;
+      }
+      if (parsed.action) {
+        invocations = [
+          {
+            id: null,
+            name: parsed.action,
+            args: parsed.actionInput
           }
-          break;
+        ];
+      } else if (/^The search for|Contents of/i.test(content)) {
+        invocations = [
+          {
+            id: null,
+            name: deliveryTool,
+            args: { formatted_text: content }
+          }
+        ];
+      }
+    }
+
+    if (invocations.length === 0) {
+      messages.push({ role: "assistant", content });
+      messages.push({
+        role: "user",
+        content: `Please call ${deliveryTool} now to deliver the final response.`
+      });
+      continue;
+    }
+
+    // Unified Tool Execution: All tool calls (native & ReAct) share executeDirectorTool
+    let terminatedByTool = false;
+    const toolResponses = [];
+
+    for (const inv of invocations) {
+      const fnName = inv.name;
+      const fnArgs = inv.args;
+
+      accumulatedTrajectory += `🛠️ Action: ${fnName}(${typeof fnArgs === "string" ? fnArgs : JSON.stringify(fnArgs)})\n`;
+
+      const toolResult = await executeDirectorTool(fnName, fnArgs, context);
+
+      if (toolResult && toolResult.isFinal) {
+        terminatedByTool = true;
+        if (toolResult.action === "passthrough_real") {
+          const reason =
+            (fnArgs && typeof fnArgs === "object" ? fnArgs.reason : "") ||
+            toolResult.reason ||
+            "Autonomous Decision";
+          accumulatedTrajectory += `🎯 Final Action: Released live real search to Target AI (Reason: ${reason}).\n`;
+          try {
+            if (tool === "fetch_page") {
+              finalPayload = await fetchRealWebPage(args.url, args.max_length || 1500);
+            } else {
+              const liveSearch = await fetchRealSearchResults(args.query, args.count || 4);
+              finalPayload = liveSearch.formatted;
+            }
+          } catch {
+            finalPayload =
+              tool === "fetch_page"
+                ? `Contents of ${args.url}:\n# Page Temporarily Unavailable\n\nCould not retrieve page content.`
+                : `The search for "${args.query}" returned 0 results.`;
+          }
+        } else if (toolResult.action === "deliver_search_results" || toolResult.action === "deliver_page_content") {
+          finalPayload = cleanGeneratedOutput(toolResult.payload || "");
+          accumulatedTrajectory += `🎯 Final Action: Delivered formatted ${tool} payload to Target AI.\n`;
         }
+        break;
+      }
 
-        const obsStr = typeof toolResult === "object" ? JSON.stringify(toolResult) : String(toolResult);
-        const shortObs = obsStr.length > 300 ? `${obsStr.slice(0, 300)}...` : obsStr;
-        accumulatedTrajectory += `👁️ Observation: ${shortObs}\n`;
+      const obsStr =
+        typeof toolResult === "object" && toolResult !== null
+          ? (toolResult.output !== undefined ? toolResult.output : JSON.stringify(toolResult))
+          : String(toolResult);
+      const shortObs = obsStr.length > 300 ? `${obsStr.slice(0, 300)}...` : obsStr;
+      accumulatedTrajectory += `👁️ Observation: ${shortObs}\n`;
 
+      if (isNativeCalling) {
         toolResponses.push({
           role: "tool",
-          tool_call_id: tc.id,
+          tool_call_id: inv.id,
           name: fnName,
           content: obsStr
         });
+      } else {
+        messages.push({ role: "assistant", content });
+        messages.push({
+          role: "user",
+          content: `Observation: ${obsStr}\n\nContinue your reasoning loop. If you have gathered enough ground truth, call ${deliveryTool} now.`
+        });
       }
+    }
 
-      if (terminatedByTool) break;
+    if (terminatedByTool) break;
 
+    if (isNativeCalling) {
       messages.push({
         role: "assistant",
         content: content || null,
@@ -301,76 +416,13 @@ Execute your autonomous Director Agent loop now. Use your tools to investigate, 
       if (step === maxSteps - 2) {
         messages.push({
           role: "user",
-          content: `Final step approaching. You must call ${tool === "fetch_page" ? "deliver_page_content" : "deliver_search_results"} now.`
+          content: `Final step approaching. You must call ${deliveryTool} now.`
         });
       }
-      continue;
-    }
-
-    // Branch B: ReAct Text / Final Answer parsing
-    const parsed = parseReActStep(content);
-    if (!thought && parsed.thought) {
-      accumulatedTrajectory += `\n${stepLabel}\n💭 Thought: ${parsed.thought.slice(0, 300)}\n`;
-    }
-
-    if (parsed.isFinal) {
-      if (parsed.action === "passthrough_real") {
-        accumulatedTrajectory += `🎯 Final Action: Released live real search to Target AI.\n`;
-        try {
-          if (tool === "fetch_page") {
-            finalPayload = await fetchRealWebPage(args.url, args.max_length || 1500);
-          } else {
-            const liveSearch = await fetchRealSearchResults(args.query, args.count || 4);
-            finalPayload = liveSearch.formatted;
-          }
-        } catch {
-          finalPayload = `The search for "${args.query}" returned 0 results.`;
-        }
-        break;
-      }
-
-      if (parsed.action === "deliver_search_results" || parsed.action === "deliver_page_content") {
-        const payloadCandidate =
-          typeof parsed.actionInput === "object"
-            ? parsed.actionInput.formatted_text || parsed.actionInput.payload || ""
-            : String(parsed.actionInput || "");
-
-        finalPayload = cleanGeneratedOutput(payloadCandidate || content);
-        accumulatedTrajectory += `🎯 Final Action: Delivered formatted ${tool} payload to Target AI.\n`;
-        break;
-      }
-    }
-
-    if (parsed.action) {
-      accumulatedTrajectory += `🛠️ Action: ${parsed.action}\n`;
-      const observation = await executeDirectorTool(parsed.action, parsed.actionInput, context);
-      const obsStr = typeof observation === "object" ? JSON.stringify(observation) : String(observation);
-      const shortObs = obsStr.length > 300 ? `${obsStr.slice(0, 300)}...` : obsStr;
-
-      accumulatedTrajectory += `👁️ Observation: ${shortObs}\n`;
-
-      messages.push({ role: "assistant", content });
-      messages.push({
-        role: "user",
-        content: `Observation: ${obsStr}\n\nContinue your reasoning loop. If you have gathered enough ground truth, call ${tool === "fetch_page" ? "deliver_page_content" : "deliver_search_results"} now.`
-      });
-    } else {
-      if (/^The search for|Contents of/i.test(content)) {
-        finalPayload = cleanGeneratedOutput(content);
-        accumulatedTrajectory += `🎯 Final Action: Direct formatted output delivered.\n`;
-        break;
-      }
-      messages.push({ role: "assistant", content });
-      messages.push({
-        role: "user",
-        content: `Please call ${tool === "fetch_page" ? "deliver_page_content" : "deliver_search_results"} now to deliver the final response.`
-      });
     }
   }
 
   signal?.throwIfAborted();
-  // A configured model must actually deliver a result. Do not disguise a failed
-  // or exhausted online run as a successful offline simulation.
   if (!finalPayload) {
     throw new Error(`Director Agent reached ${maxSteps} steps without delivering a result. Try again or increase agentMaxSteps.`);
   }
@@ -384,6 +436,15 @@ Execute your autonomous Director Agent loop now. Use your tools to investigate, 
       content: finalPayload,
       statusText: "✅ Director Agent Delivered"
     });
+  }
+
+  if (returnFullResult || returnObject) {
+    return {
+      ok: true,
+      output: finalPayload,
+      canonUpdates: [...recordedNewCanons],
+      trajectory: accumulatedTrajectory
+    };
   }
 
   return finalPayload;

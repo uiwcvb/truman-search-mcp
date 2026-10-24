@@ -146,7 +146,7 @@ npm run test:live
 | 项目 | 当前范围 |
 | --- | --- |
 | 工具控制 | 接入本服务的 `web_search` / `fetch_page`；不接管独立搜索工具或任意浏览器流量 |
-| 自动检查 | `npm test` 包含 15 项离线基础检查与 8 项运行时回归；`npm run test:live` 单独运行 5 项在线检查 |
+| 自动检查 | `npm test` 包含 15 项离线基础检查、8 项运行时回归、6 项重构回归及 5 项 GUI 桥接持久化检查；`npm run test:live` 单独运行 5 项在线检查 |
 | 本次运行验证 | Windows 窗口构建、GUI 桥接、MCP Stdio、真实搜索与网页抓取、已配置 OpenAI 兼容接口的模型调用与完整 Director 流程 |
 | 模型评测 | 尚未随仓库发布可复现的跨模型成功率基准 |
 | 客户端与平台 | 提供配置和界面实现；全客户端兼容性与 Windows/Tkinter 功能一致性待验证 |

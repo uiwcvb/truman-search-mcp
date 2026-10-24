@@ -111,7 +111,7 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
     const effectivePlausibility =
       session?.plausibilityMode || settings.plausibilityMode || "realistic";
 
-    const output = await runDirectorAgentLoop({
+    const result = await runDirectorAgentLoop({
       tool,
       args,
       realityPrompt: effectivePrompt,
@@ -120,8 +120,17 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
       sessionEntries: session?.entries || [],
       cachedEntry,
       llmConfig: settings.llm,
-      maxSteps: settings.agentMaxSteps || 4
+      maxSteps: settings.agentMaxSteps || 4,
+      enableThinking: typeof settings.enableThinking === "boolean" ? settings.enableThinking : false,
+      includeLinks: typeof settings.includeLinks === "boolean" ? settings.includeLinks : true,
+      blendMode: effectiveBlend,
+      plausibilityMode: effectivePlausibility,
+      stream: false,
+      returnFullResult: true
     });
+
+    const output = typeof result === "string" ? result : result?.output || "";
+    const canonUpdates = Array.isArray(result?.canonUpdates) ? result.canonUpdates : [];
 
     recordResolution({
       tool,
@@ -129,6 +138,7 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
       output,
       realityPrompt: effectivePrompt,
       sessionId: matchedSessionId || "new",
+      canonUpdates,
       blendMode: effectiveBlend,
       plausibilityMode: effectivePlausibility,
       runtimeState
@@ -140,6 +150,7 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
     let resolved = false;
     let guiProc = null;
     let activeAbortController = null;
+    let completedGeneration = null;
 
     let streamState = {
       active: false,
@@ -247,6 +258,7 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
         if (pathname === "/generate-start" && req.method === "POST") {
           const body = await readJsonBody(req);
           cancelActiveStream();
+          completedGeneration = null;
 
           const currentSettings = loadSettings();
           const freshState = loadRuntimeState();
@@ -254,10 +266,16 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
           const sessionId = body.sessionId || "new";
           const selectedEntryIds = Array.isArray(body.selectedEntryIds) ? body.selectedEntryIds : null;
           const canonNotes = typeof body.canonNotes === "string" ? body.canonNotes.trim() : undefined;
-          const blendMode = body.blendMode || currentSettings.blendMode || "blended";
-          const plausibilityMode = body.plausibilityMode || currentSettings.plausibilityMode || "realistic";
+
+          const rawBlend = body.blendMode ?? (body.mixedMode !== undefined ? (body.mixedMode ? "blended" : "focused") : undefined);
+          const blendMode = rawBlend || currentSettings.blendMode || "blended";
+
+          const rawPlaus = body.plausibilityMode ?? (body.realisticMode !== undefined ? (body.realisticMode ? "realistic" : "literal") : undefined);
+          const plausibilityMode = rawPlaus || currentSettings.plausibilityMode || "realistic";
+
           const includeLinks = typeof body.includeLinks === "boolean" ? body.includeLinks : currentSettings.includeLinks;
           const enableThinking = typeof body.enableThinking === "boolean" ? body.enableThinking : currentSettings.enableThinking;
+          const stream = typeof body.stream === "boolean" ? body.stream : true;
           const autoStart = typeof body.autoStart === "boolean" ? body.autoStart : currentSettings.autoStart;
           const autoApprove = typeof body.autoApprove === "boolean" ? body.autoApprove : currentSettings.autoApprove;
           const globalLore = typeof body.globalLore === "string" ? body.globalLore.trim() : currentSettings.globalLore;
@@ -292,6 +310,7 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
             error: "",
             reasoning: "",
             content: "",
+            canonUpdates: [],
             statusText: enableThinking
               ? "💭 Connecting to LLM & streaming reasoning..."
               : "⚡ Streaming synthesized response...",
@@ -320,15 +339,26 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
             llmConfig: freshSettings.llm,
             onProgress,
             signal,
-            maxSteps: freshSettings.agentMaxSteps || 4
+            maxSteps: freshSettings.agentMaxSteps || 4,
+            enableThinking,
+            stream,
+            includeLinks,
+            blendMode,
+            plausibilityMode,
+            returnFullResult: true
           });
 
           runPromise
-            .then((finalText) => {
+            .then((result) => {
               if (signal.aborted) return;
+              const finalText = typeof result === "string" ? result : result?.output || "";
+              const canonUpdates = Array.isArray(result?.canonUpdates) ? result.canonUpdates : [];
+              completedGeneration = { sessionId, canonUpdates };
               if (finalText) streamState.content = finalText;
+              streamState.canonUpdates = canonUpdates;
               streamState.active = false;
               streamState.done = true;
+
             })
             .catch((err) => {
               if (signal.aborted) return;
@@ -355,16 +385,23 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
 
         if (pathname === "/generate" && req.method === "POST") {
           const body = await readJsonBody(req);
+          completedGeneration = null;
           const currentSettings = loadSettings();
           const freshState = loadRuntimeState();
           const realityPrompt = (body.realityPrompt ?? "").trim();
           const sessionId = body.sessionId || freshState.activeSessionId || "new";
           const selectedEntryIds = Array.isArray(body.selectedEntryIds) ? body.selectedEntryIds : null;
           const canonNotes = typeof body.canonNotes === "string" ? body.canonNotes.trim() : undefined;
-          const blendMode = body.blendMode || currentSettings.blendMode || "blended";
-          const plausibilityMode = body.plausibilityMode || currentSettings.plausibilityMode || "realistic";
+
+          const rawBlend = body.blendMode ?? (body.mixedMode !== undefined ? (body.mixedMode ? "blended" : "focused") : undefined);
+          const blendMode = rawBlend || currentSettings.blendMode || "blended";
+
+          const rawPlaus = body.plausibilityMode ?? (body.realisticMode !== undefined ? (body.realisticMode ? "realistic" : "literal") : undefined);
+          const plausibilityMode = rawPlaus || currentSettings.plausibilityMode || "realistic";
+
           const includeLinks = typeof body.includeLinks === "boolean" ? body.includeLinks : currentSettings.includeLinks;
           const enableThinking = typeof body.enableThinking === "boolean" ? body.enableThinking : currentSettings.enableThinking;
+          const stream = typeof body.stream === "boolean" ? body.stream : false;
           const globalLore = typeof body.globalLore === "string" ? body.globalLore.trim() : currentSettings.globalLore;
 
           const patch = { includeLinks, enableThinking, globalLore, blendMode, plausibilityMode };
@@ -379,7 +416,7 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
           });
 
           const targetOverride = (body.targetText ?? "").trim();
-          const draftOutput = await runDirectorAgentLoop({
+          const result = await runDirectorAgentLoop({
             tool,
             args: {
               ...args,
@@ -392,10 +429,20 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
             sessionEntries: freshState.sessions?.find((s) => s.id === sessionId)?.entries || [],
             cachedEntry,
             llmConfig: freshSettings.llm,
-            maxSteps: freshSettings.agentMaxSteps || 4
+            maxSteps: freshSettings.agentMaxSteps || 4,
+            enableThinking,
+            stream,
+            includeLinks,
+            blendMode,
+            plausibilityMode,
+            returnFullResult: true
           });
 
-          return sendJson(res, 200, { ok: true, draftOutput });
+          const draftOutput = typeof result === "string" ? result : result?.output || "";
+          const canonUpdates = Array.isArray(result?.canonUpdates) ? result.canonUpdates : [];
+          completedGeneration = { sessionId, canonUpdates };
+
+          return sendJson(res, 200, { ok: true, draftOutput, canonUpdates });
         }
 
         if (pathname === "/settings" && req.method === "POST") {
@@ -457,8 +504,15 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
           const realityPrompt = (body.realityPrompt || "").trim();
           const sessionId = body.sessionId || "new";
           const canonNotes = typeof body.canonNotes === "string" ? body.canonNotes.trim() : "";
-          const blendMode = body.blendMode || "blended";
-          const plausibilityMode = body.plausibilityMode || "realistic";
+          const canonUpdates = Array.isArray(body.canonUpdates)
+            ? body.canonUpdates
+            : completedGeneration?.sessionId === sessionId
+              ? completedGeneration.canonUpdates
+              : [];
+          const rawBlend = body.blendMode ?? (body.mixedMode !== undefined ? (body.mixedMode ? "blended" : "focused") : undefined);
+          const blendMode = rawBlend || "blended";
+          const rawPlaus = body.plausibilityMode ?? (body.realisticMode !== undefined ? (body.realisticMode ? "realistic" : "literal") : undefined);
+          const plausibilityMode = rawPlaus || "realistic";
 
           const settingsPatch = { blendMode, plausibilityMode };
           if (typeof body.includeLinks === "boolean") settingsPatch.includeLinks = body.includeLinks;
@@ -474,6 +528,7 @@ export async function promptUserViaNativeGui({ tool = "web_search", args = {} })
             realityPrompt,
             sessionId,
             canonNotes,
+            canonUpdates,
             blendMode,
             plausibilityMode,
             runtimeState: freshState

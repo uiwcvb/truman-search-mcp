@@ -15,200 +15,68 @@ export function isKeylessAllowed(baseUrl = "", provider = "") {
   );
 }
 
-/**
- * Robust LLM caller supporting OpenAI-compatible, Anthropic, and Gemini providers.
- * Supports SSE streaming, reasoning extraction, native tool calling, and 503 retries.
- */
-export async function callLLMMessages(llmConfig, messages = [], options = {}) {
-  const provider = (llmConfig?.provider || "openai").toLowerCase();
-  const apiKey = (llmConfig?.apiKey || "").trim();
-  const model = (llmConfig?.model || "gpt-4o-mini").trim();
-  let baseUrl = (llmConfig?.baseUrl || "https://api.openai.com/v1").trim().replace(/\/+$/, "");
-  const enableThinking = options.enableThinking !== undefined ? Boolean(options.enableThinking) : true;
-  const configuredMax = Number(options.maxTokens || llmConfig?.maxTokens) || 0;
-  const maxTokens = configuredMax > 0 ? configuredMax : 16384;
-  const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
-  const signal = options.signal || undefined;
+// ---------------------------------------------------------------------------
+// 1. Protocol Adaptation Helpers
+// ---------------------------------------------------------------------------
 
-  if (!isKeylessAllowed(baseUrl, provider) && !apiKey) {
-    throw new Error("LLM API Key not configured (set in Settings or use a local endpoint)");
-  }
-
-  const systemMessage = messages.find((m) => m.role === "system")?.content || "";
-  const nonSystemMessages = messages.filter((m) => m.role !== "system");
-
-  // Provider: Gemini
-  if (provider === "gemini") {
-    const geminiBase = baseUrl.includes("generativelanguage.googleapis.com")
-      ? baseUrl
-      : "https://generativelanguage.googleapis.com/v1beta";
-    const url = `${geminiBase}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-    const contents = nonSystemMessages.map((m) => ({
-      role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content || "" }]
-    }));
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal,
-      body: JSON.stringify({
-        systemInstruction: systemMessage ? { parts: [{ text: systemMessage }] } : undefined,
-        contents: contents.length > 0 ? contents : [{ role: "user", parts: [{ text: "Hello" }] }],
-        generationConfig: { temperature: 0.6, maxOutputTokens: maxTokens }
-      })
-    });
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`Gemini API Error (${res.status}): ${errText.slice(0, 300)}`);
-    }
-    const data = await res.json();
-    const rawText = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
-    const { reasoning, content } = splitThinkAndContent(rawText, "", { enableThinking });
-    if (onProgress) onProgress({ reasoning, content });
-    if (!content) throw new Error("Gemini API returned empty content");
-    if (options.returnFullMessage) {
-      return { role: "assistant", content: content.trim(), reasoning: reasoning.trim(), tool_calls: null };
-    }
-    return content.trim();
-  }
-
-  // Provider: Anthropic
-  if (provider === "anthropic") {
-    const anthropicBase = baseUrl.includes("anthropic.com") ? baseUrl : "https://api.anthropic.com/v1";
-    const url = anthropicBase.endsWith("/messages") ? anthropicBase : `${anthropicBase}/messages`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01"
-      },
-      signal,
-      body: JSON.stringify({
-        model,
-        max_tokens: maxTokens,
-        system: systemMessage,
-        messages: nonSystemMessages.map((m) => ({
-          role: m.role === "assistant" ? "assistant" : "user",
-          content: m.content || ""
-        }))
-      })
-    });
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`Anthropic API Error (${res.status}): ${errText.slice(0, 300)}`);
-    }
-    const data = await res.json();
-    const rawText = data?.content?.map((c) => c.text || "").join("") || "";
-    const { reasoning, content } = splitThinkAndContent(rawText, "", { enableThinking });
-    if (onProgress) onProgress({ reasoning, content });
-    if (!content) throw new Error("Anthropic API returned empty content");
-    if (options.returnFullMessage) {
-      return { role: "assistant", content: content.trim(), reasoning: reasoning.trim(), tool_calls: null };
-    }
-    return content.trim();
-  }
-
-  // Provider: OpenAI-compatible
-  const endpoint = baseUrl.endsWith("/chat/completions") ? baseUrl : `${baseUrl}/chat/completions`;
-  const headers = { "Content-Type": "application/json" };
-  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-
-  const useStream = Boolean(options.stream ?? true);
+export function buildOpenAiPayload({
+  model,
+  messages,
+  maxTokens,
+  enableThinking,
+  useStream,
+  tools,
+  includeThinkKwarg = false,
+  includeTools = true
+}) {
   const effectiveMaxTokens = enableThinking ? maxTokens : Math.min(maxTokens, 4096);
-  const isLocalEndpoint = isKeylessAllowed(baseUrl, provider);
-
-  const buildPayload = (includeThinkKwarg = false, includeTools = true) => {
-    const payload = {
-      model,
-      temperature: 0.55,
-      max_tokens: effectiveMaxTokens,
-      stream: useStream,
-      messages: messages.length > 0 ? messages : [{ role: "user", content: "Hello" }]
-    };
-    if (includeTools && Array.isArray(options.tools) && options.tools.length > 0) {
-      payload.tools = options.tools;
-    }
-    if (includeThinkKwarg) {
-      payload.chat_template_kwargs = { enable_thinking: enableThinking };
-    }
-    return payload;
+  const payload = {
+    model,
+    temperature: 0.55,
+    max_tokens: effectiveMaxTokens,
+    stream: useStream,
+    messages: messages.length > 0 ? messages : [{ role: "user", content: "Hello" }]
   };
+  if (includeTools && Array.isArray(tools) && tools.length > 0) {
+    payload.tools = tools;
+  }
+  if (includeThinkKwarg) {
+    payload.chat_template_kwargs = { enable_thinking: enableThinking };
+  }
+  return payload;
+}
 
-  let res = null;
-  let lastErrText = "";
-  for (let attempt = 0; attempt < 5; attempt++) {
-    res = await fetch(endpoint, {
-      method: "POST",
-      headers,
-      signal,
-      body: JSON.stringify(buildPayload(isLocalEndpoint, true))
-    });
+// ---------------------------------------------------------------------------
+// 2. Response Parsing Helpers (JSON and SSE Streams)
+// ---------------------------------------------------------------------------
 
-    if (res.status === 400 && isLocalEndpoint) {
-      res = await fetch(endpoint, {
-        method: "POST",
-        headers,
-        signal,
-        body: JSON.stringify(buildPayload(false, true))
-      });
-    }
+export async function parseOpenAiJsonResponse(res, { enableThinking, onProgress, options }) {
+  const data = await res.json();
+  const msg = data?.choices?.[0]?.message || {};
+  const { reasoning, content } = splitThinkAndContent(
+    msg.content || "",
+    msg.reasoning_content || msg.reasoning || "",
+    { enableThinking }
+  );
+  if (onProgress) onProgress({ reasoning, content });
 
-    if (res.status === 400 && Array.isArray(options.tools)) {
-      // Endpoint may not support tools schema; fallback to prompt-only
-      res = await fetch(endpoint, {
-        method: "POST",
-        headers,
-        signal,
-        body: JSON.stringify(buildPayload(false, false))
-      });
-    }
-
-    if (res.status !== 503) break;
-    lastErrText = await res.text();
-    if (onProgress) {
-      onProgress({
-        reasoning: "",
-        content: "",
-        statusText: `⏳ Model busy (503), retrying (${attempt + 1}/5)...`
-      });
-    }
-    await new Promise((r) => setTimeout(r, 900));
+  if (options.returnFullMessage) {
+    return {
+      role: "assistant",
+      content: content.trim(),
+      reasoning: reasoning.trim(),
+      tool_calls: Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0 ? msg.tool_calls : null
+    };
   }
 
-  if (!res.ok) {
-    const errText = lastErrText || (await res.text());
-    throw new Error(`LLM API Error (${res.status}): ${errText.slice(0, 300)}`);
+  const finalOut = (content || reasoning).trim();
+  if (!finalOut && (!msg.tool_calls || msg.tool_calls.length === 0)) {
+    throw new Error("LLM API returned empty content");
   }
+  return finalOut;
+}
 
-  const contentType = (res.headers.get("content-type") || "").toLowerCase();
-  if (!useStream || !contentType.includes("text/event-stream")) {
-    const data = await res.json();
-    const msg = data?.choices?.[0]?.message || {};
-    const { reasoning, content } = splitThinkAndContent(
-      msg.content || "",
-      msg.reasoning_content || msg.reasoning || "",
-      { enableThinking }
-    );
-    if (onProgress) onProgress({ reasoning, content });
-
-    if (options.returnFullMessage) {
-      return {
-        role: "assistant",
-        content: content.trim(),
-        reasoning: reasoning.trim(),
-        tool_calls: Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0 ? msg.tool_calls : null
-      };
-    }
-
-    const finalOut = (content || reasoning).trim();
-    if (!finalOut && (!msg.tool_calls || msg.tool_calls.length === 0)) {
-      throw new Error("LLM API returned empty content");
-    }
-    return finalOut;
-  }
-
-  // Parse SSE stream
+export async function parseOpenAiSseStream(res, { enableThinking, onProgress, options }) {
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
   let rawContentAcc = "";
@@ -286,6 +154,317 @@ export async function callLLMMessages(llmConfig, messages = [], options = {}) {
     throw new Error("LLM stream returned empty output");
   }
   return finalResult;
+}
+
+// ---------------------------------------------------------------------------
+// 3. Single-Attempt Execution with Isolated Attempt State
+// ---------------------------------------------------------------------------
+
+export async function executeOpenAiAttempt({
+  endpoint,
+  headers,
+  payload,
+  useStream,
+  enableThinking,
+  signal,
+  onProgress,
+  options
+}) {
+  let res = null;
+  try {
+    res = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      signal,
+      body: JSON.stringify(payload)
+    });
+  } catch (netErr) {
+    return {
+      ok: false,
+      status: 0,
+      errorText: netErr.message || String(netErr),
+      error: netErr
+    };
+  }
+
+  if (!res.ok) {
+    // Read error body specifically from this isolated attempt
+    const errorText = await res.text().catch(() => "");
+    const error = new Error(`LLM API Error (${res.status}): ${errorText.slice(0, 300)}`);
+    error.status = res.status;
+    error.responseBody = errorText;
+    return {
+      ok: false,
+      status: res.status,
+      errorText,
+      error
+    };
+  }
+
+  const contentType = (res.headers.get("content-type") || "").toLowerCase();
+  const isSse = useStream && contentType.includes("text/event-stream");
+
+  try {
+    const result = isSse
+      ? await parseOpenAiSseStream(res, { enableThinking, onProgress, options })
+      : await parseOpenAiJsonResponse(res, { enableThinking, onProgress, options });
+    return {
+      ok: true,
+      status: res.status,
+      result
+    };
+  } catch (parseErr) {
+    return {
+      ok: false,
+      status: res.status,
+      errorText: parseErr.message,
+      error: parseErr
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Retry & Compatibility Fallback Orchestrator
+// ---------------------------------------------------------------------------
+
+export async function callOpenAiWithRetries({
+  endpoint,
+  headers,
+  model,
+  messages,
+  maxTokens,
+  enableThinking,
+  useStream,
+  tools,
+  isLocalEndpoint,
+  signal,
+  onProgress,
+  options
+}) {
+  let lastAttemptError = null;
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    signal?.throwIfAborted();
+
+    // 1. Primary execution attempt
+    const primaryPayload = buildOpenAiPayload({
+      model,
+      messages,
+      maxTokens,
+      enableThinking,
+      useStream,
+      tools,
+      includeThinkKwarg: isLocalEndpoint,
+      includeTools: true
+    });
+
+    let attemptResult = await executeOpenAiAttempt({
+      endpoint,
+      headers,
+      payload: primaryPayload,
+      useStream,
+      enableThinking,
+      signal,
+      onProgress,
+      options
+    });
+
+    // 2. Fallback: if 400 and local endpoint, try without chat_template_kwargs
+    if (!attemptResult.ok && attemptResult.status === 400 && isLocalEndpoint) {
+      const noKwargsPayload = buildOpenAiPayload({
+        model,
+        messages,
+        maxTokens,
+        enableThinking,
+        useStream,
+        tools,
+        includeThinkKwarg: false,
+        includeTools: true
+      });
+      attemptResult = await executeOpenAiAttempt({
+        endpoint,
+        headers,
+        payload: noKwargsPayload,
+        useStream,
+        enableThinking,
+        signal,
+        onProgress,
+        options
+      });
+    }
+
+    // 3. Fallback: if 400 and tools provided, endpoint may not support tools schema
+    if (!attemptResult.ok && attemptResult.status === 400 && Array.isArray(tools) && tools.length > 0) {
+      const noToolsPayload = buildOpenAiPayload({
+        model,
+        messages,
+        maxTokens,
+        enableThinking,
+        useStream,
+        tools: null,
+        includeThinkKwarg: false,
+        includeTools: false
+      });
+      attemptResult = await executeOpenAiAttempt({
+        endpoint,
+        headers,
+        payload: noToolsPayload,
+        useStream,
+        enableThinking,
+        signal,
+        onProgress,
+        options
+      });
+    }
+
+    if (attemptResult.ok) {
+      return attemptResult.result;
+    }
+
+    // Isolate error state: each attempt carries strictly its own error
+    lastAttemptError = attemptResult.error;
+
+    // Only retry on 503
+    if (attemptResult.status !== 503) {
+      throw lastAttemptError;
+    }
+
+    if (attempt < 4) {
+      if (onProgress) {
+        onProgress({
+          reasoning: "",
+          content: "",
+          statusText: `⏳ Model busy (503), retrying (${attempt + 1}/5)...`
+        });
+      }
+      await new Promise((r) => setTimeout(r, 900));
+    }
+  }
+
+  throw lastAttemptError;
+}
+
+// ---------------------------------------------------------------------------
+// 5. Unified Multi-Provider Entry Point
+// ---------------------------------------------------------------------------
+
+export async function callLLMMessages(llmConfig, messages = [], options = {}) {
+  const provider = (llmConfig?.provider || "openai").toLowerCase();
+  const apiKey = (llmConfig?.apiKey || "").trim();
+  const model = (llmConfig?.model || "gpt-4o-mini").trim();
+  let baseUrl = (llmConfig?.baseUrl || "https://api.openai.com/v1").trim().replace(/\/+$/, "");
+
+  // Respect boolean false cleanly: options.enableThinking ?? llmConfig?.enableThinking ?? false
+  const enableThinking = options.enableThinking !== undefined
+    ? Boolean(options.enableThinking)
+    : (llmConfig?.enableThinking !== undefined ? Boolean(llmConfig.enableThinking) : false);
+
+  const configuredMax = Number(options.maxTokens || llmConfig?.maxTokens) || 0;
+  const maxTokens = configuredMax > 0 ? configuredMax : 16384;
+  const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
+  const signal = options.signal || undefined;
+
+  if (!isKeylessAllowed(baseUrl, provider) && !apiKey) {
+    throw new Error("LLM API Key not configured (set in Settings or use a local endpoint)");
+  }
+
+  const systemMessage = messages.find((m) => m.role === "system")?.content || "";
+  const nonSystemMessages = messages.filter((m) => m.role !== "system");
+
+  // Provider: Gemini
+  if (provider === "gemini") {
+    const geminiBase = baseUrl.includes("generativelanguage.googleapis.com")
+      ? baseUrl
+      : "https://generativelanguage.googleapis.com/v1beta";
+    const url = `${geminiBase}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const contents = nonSystemMessages.map((m) => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content || "" }]
+    }));
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal,
+      body: JSON.stringify({
+        systemInstruction: systemMessage ? { parts: [{ text: systemMessage }] } : undefined,
+        contents: contents.length > 0 ? contents : [{ role: "user", parts: [{ text: "Hello" }] }],
+        generationConfig: { temperature: 0.6, maxOutputTokens: maxTokens }
+      })
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(`Gemini API Error (${res.status}): ${errText.slice(0, 300)}`);
+    }
+    const data = await res.json();
+    const rawText = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
+    const { reasoning, content } = splitThinkAndContent(rawText, "", { enableThinking });
+    if (onProgress) onProgress({ reasoning, content });
+    if (!content) throw new Error("Gemini API returned empty content");
+    if (options.returnFullMessage) {
+      return { role: "assistant", content: content.trim(), reasoning: reasoning.trim(), tool_calls: null };
+    }
+    return content.trim();
+  }
+
+  // Provider: Anthropic
+  if (provider === "anthropic") {
+    const anthropicBase = baseUrl.includes("anthropic.com") ? baseUrl : "https://api.anthropic.com/v1";
+    const url = anthropicBase.endsWith("/messages") ? anthropicBase : `${anthropicBase}/messages`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01"
+      },
+      signal,
+      body: JSON.stringify({
+        model,
+        max_tokens: maxTokens,
+        system: systemMessage,
+        messages: nonSystemMessages.map((m) => ({
+          role: m.role === "assistant" ? "assistant" : "user",
+          content: m.content || ""
+        }))
+      })
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(`Anthropic API Error (${res.status}): ${errText.slice(0, 300)}`);
+    }
+    const data = await res.json();
+    const rawText = data?.content?.map((c) => c.text || "").join("") || "";
+    const { reasoning, content } = splitThinkAndContent(rawText, "", { enableThinking });
+    if (onProgress) onProgress({ reasoning, content });
+    if (!content) throw new Error("Anthropic API returned empty content");
+    if (options.returnFullMessage) {
+      return { role: "assistant", content: content.trim(), reasoning: reasoning.trim(), tool_calls: null };
+    }
+    return content.trim();
+  }
+
+  // Provider: OpenAI-compatible
+  const endpoint = baseUrl.endsWith("/chat/completions") ? baseUrl : `${baseUrl}/chat/completions`;
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+  const useStream = Boolean(options.stream ?? true);
+  const isLocalEndpoint = isKeylessAllowed(baseUrl, provider);
+
+  return callOpenAiWithRetries({
+    endpoint,
+    headers,
+    model,
+    messages,
+    maxTokens,
+    enableThinking,
+    useStream,
+    tools: options.tools,
+    isLocalEndpoint,
+    signal,
+    onProgress,
+    options
+  });
 }
 
 /**
